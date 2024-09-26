@@ -234,3 +234,8 @@ class LinearMapping(nn.Module):
     
     def forward(self, x):
         return self.network(x)
+    
+class Swish(nn.Module):
+    """Swish activation function"""
+    def forward(self, x):
+        return x * torch.sigmoid(x)

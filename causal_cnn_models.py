@@ -312,6 +312,128 @@ class FoldVaeClassifFoldWeight(nn.Module):
         target.scatter_add_(dim, x, values)
         return target
 
+class FoldVaeClassifFoldWeightParameterizer(nn.Module):
+    """
+    The VAE method is able to encode a given input into
+    mean and log. variance parameters for Gaussian
+    distributions that make up a compressed space that represents
+    the input. Then, a sample from that space can be decoded into
+    an attempted, probably less detailed, reconstruction of the
+    original input.
+    """
+
+    def __init__(
+            self, encoder_params, decoder_params, n_split=2, n_class=2, 
+            log=print, debug=True):
+        super().__init__()
+        self.n_split = n_split
+        self.log = log
+        self.encoder_params = encoder_params
+        self.n_class = n_class
+        
+        self.encoder = CausalCNNVEncoder(**self.encoder_params)
+        
+        # Adjust decoder split params
+        self.decoder_params = decoder_params.copy()
+        self.w_split = self.decoder_params['width'] // self.n_split
+        self.width_src = self.decoder_params['width']
+        self.decoder_params['width'] = self.w_split
+        
+        self.decoder = CausalCNNVDecoder(**self.decoder_params)
+        self.out_sigmoid = nn.Sigmoid()
+
+        self.parameterizer = Parameterizer(self.encoder_params["in_channels"], 32, 5, n_split)
+        self.aggregator = Aggregator(32, n_class)
+        self.classif_stage = nn.Softmax(dim=1)
+
+        self.debug = debug
+        
+        self.kl = 0
+    
+    def reparameterize(self, mu, sd):
+        """Sample from a Gaussian distribution with given mean and s.d."""
+        eps = torch.normal(torch.zeros_like(mu), torch.ones_like(sd))
+        return mu + eps * sd
+    
+    def forward(self, x):
+        """Return reconstructed input after compressing it"""
+        self.log(f"input: {x.shape}") if self.debug else None
+        z = None
+        x_hat = None
+        enc_mu, enc_sd = None, None
+        z_folds = None
+        for i_split in range(self.n_split):
+            x_split = x[:, :, i_split*self.w_split:(i_split+1)*self.w_split]
+
+            # encoding
+            _enc_mu, _enc_sd = self.encoder(x_split)
+            self.log(f"--VAE enc_mu:{_enc_mu.shape}, enc_sd:{_enc_sd.shape}") if self.debug else None
+            _z = self.reparameterize(_enc_mu, _enc_sd)
+            r"Add all _enc_mu and _enc_sd to do average later."
+            _enc_mu = _enc_mu.view(_enc_mu.size(0), 1, -1)
+            _enc_sd = _enc_sd.view(_enc_sd.size(0), 1, -1)
+            if enc_mu is None:
+                enc_mu = _enc_mu
+                enc_sd = _enc_sd
+            else:
+                enc_mu = torch.cat((enc_mu, _enc_mu), dim=1)
+                enc_sd = torch.cat((enc_sd, _enc_sd), dim=1)
+            self.log(f"--VAE _z:{_z.shape}, enc_mu:{enc_mu.shape}, enc_sd:{enc_sd.shape}") if self.debug else None
+            if z is None:
+                z = _z
+                r"(B, Fold#, Z_fold)"
+                z_folds = torch.unsqueeze(_z, 1)
+            else:
+                z = torch.cat((z, _z), dim=1)
+                z_folds = torch.cat((z_folds, torch.unsqueeze(_z, 1)), dim=1)
+            self.log(f"ENC x_split[{i_split}]:{x_split.size()}, _z:{_z.size()}, z:{z.size()}") if self.debug else None
+
+            # decoding
+            _x_hat = self.decoder(_z)
+            _x_hat = self.out_sigmoid(_x_hat)
+            if x_hat is None:
+                x_hat = _x_hat
+            else:
+                x_hat = torch.cat((x_hat, _x_hat), dim=2)
+            self.log(f"DEC x_split[{i_split}]:{x_split.size()}, _x_hat:{_x_hat.size()}, x_hat:{x_hat.size()}") if self.debug else None
+
+        r"Average enc_mu and enc_sd"
+        enc_mu = torch.mean(enc_mu, 1)
+        enc_sd = torch.mean(enc_sd, 1)
+        self.log(f"Aggregate enc_mu:{enc_mu.shape}, enc_sd:{enc_sd.shape}") if self.debug else None
+        # calculate kl loss
+        # 
+        sigma = enc_sd
+        # self.log(f"z: {z.shape}") if self.debug else None
+      
+        self.kl = -0.5 * torch.sum(1 + sigma - enc_mu.pow(2) - sigma.exp(), dim=1)
+        self.kl = self.kl.mean()
+
+        # Calculate relevance weights on signal
+        relevance_weights = self.parameterizer(x)
+        
+        # Aggregate folds and relevance weights
+        out = self.aggregator(z_folds, relevance_weights)
+        
+        z_folds = z_folds.view(z_folds.size(0), -1)
+        self.log(f"z_folds_flat: {z_folds.shape}") if self.debug else None
+
+        if self.debug:
+            self.debug = not self.debug
+
+        return {
+            'x_hat':x_hat, 
+            'z':z,
+            'clz_proba': self.classif_stage(out),
+            'w_folds': relevance_weights.detach().cpu().numpy()
+        }
+
+    def batched_bincount(self, x, dim, max_value):
+        target = torch.zeros(x.shape[0], max_value, dtype=x.dtype, device=x.device)
+        values = torch.ones_like(x)
+        target.scatter_add_(dim, x, values)
+        return target
+
 
 class FoldVaeClassif(nn.Module):
     """
@@ -743,7 +865,6 @@ class CausalCNNVDecoder(torch.nn.Module):
         return out
     
 
-
 class FoldCausalCNNVEncoder(torch.nn.Module):
     """
     Variational encoder. Difference is that we need two outputs: mean and
@@ -789,6 +910,103 @@ class FoldCausalCNNVEncoder(torch.nn.Module):
         return self.linear_mean(out).squeeze()
     
 
+class ConvNormPool(nn.Module):
+    """Conv Skip-connection module"""
+
+    def __init__(self, input_size, hidden_size, kernel_size, norm_type="batchnorm"):
+        super().__init__()
+
+        self.kernel_size = kernel_size
+        self.conv_1 = nn.Conv1d(
+            in_channels=input_size, out_channels=hidden_size, kernel_size=kernel_size
+        )
+        self.conv_2 = nn.Conv1d(
+            in_channels=hidden_size, out_channels=hidden_size, kernel_size=kernel_size
+        )
+        self.conv_3 = nn.Conv1d(
+            in_channels=hidden_size, out_channels=hidden_size, kernel_size=kernel_size
+        )
+        self.swish_1 = modules.Swish()
+        self.swish_2 = modules.Swish()
+        self.swish_3 = modules.Swish()
+        if norm_type == "group":
+            self.normalization_1 = nn.GroupNorm(num_groups=8, num_channels=hidden_size)
+            self.normalization_2 = nn.GroupNorm(num_groups=8, num_channels=hidden_size)
+            self.normalization_3 = nn.GroupNorm(num_groups=8, num_channels=hidden_size)
+        else:
+            self.normalization_1 = nn.BatchNorm1d(num_features=hidden_size)
+            self.normalization_2 = nn.BatchNorm1d(num_features=hidden_size)
+            self.normalization_3 = nn.BatchNorm1d(num_features=hidden_size)
+
+        self.pool = nn.MaxPool1d(kernel_size=2)
+
+    def forward(self, input):
+        conv1 = self.conv_1(input)
+        x = self.normalization_1(conv1)
+        x = self.swish_1(x)
+        x = F.pad(x, pad=(self.kernel_size - 1, 0))
+
+        x = self.conv_2(x)
+        x = self.normalization_2(x)
+        x = self.swish_2(x)
+        x = F.pad(x, pad=(self.kernel_size - 1, 0))
+
+        conv3 = self.conv_3(x)
+        x = self.normalization_3(conv1 + conv3)
+        x = self.swish_3(x)
+        x = F.pad(x, pad=(self.kernel_size - 1, 0))
+
+        x = self.pool(x)
+        return x
+
+
+class Parameterizer(nn.Module):
+
+    def __init__(self, d_input, d_hidden, d_kernel, n_split, dropout=0.5):
+        super().__init__()
+
+        self.encoder = nn.Sequential(
+            ConvNormPool(d_input, d_hidden, d_kernel),
+            nn.AdaptiveMaxPool1d((1))
+        )
+
+        self.proj = nn.Sequential(
+            nn.BatchNorm1d(d_hidden),
+            modules.Swish(),
+            nn.Dropout(dropout),
+            nn.Linear(d_hidden, n_split),
+            nn.Softplus(),
+        )
+
+    def forward(self, x):
+        
+        Batch = x.shape[0]
+        
+        encoded_sequence = self.encoder(x).reshape(Batch, -1)
+        relevance_weights = self.proj(encoded_sequence)
+
+        return relevance_weights
+    
+class Aggregator(nn.Module):
+    def __init__(self, d_hidden, d_out):
+        super().__init__()
+
+        self.fc = nn.Sequential(
+            nn.BatchNorm1d(d_hidden),
+            modules.Swish(),
+            nn.Linear(d_hidden, d_out)
+        )
+
+    def forward(self, z_folds, relevance_weights, ignore_relevance_weights=False):
+
+        (Batch, Folds) = relevance_weights.shape
+
+        out = self.fc(z_folds.reshape(Batch * Folds, -1))
+        if not ignore_relevance_weights:
+            out = (out.reshape(Batch, Folds, -1) * relevance_weights.unsqueeze(-1)).sum(
+                    1
+                )
+        return out
 
 
 def main():
@@ -832,7 +1050,6 @@ def main():
         criteria_classif = nn.CrossEntropyLoss()
         loss = criteria_classif(clz_proba, y.to(torch.int64))
         loss.backward()
-
 
 if __name__ == '__main__':
     main()

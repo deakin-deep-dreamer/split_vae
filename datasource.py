@@ -309,7 +309,7 @@ class MesaDbCsv():
     def find_age(self, rec_name):
         if not hasattr(self, 'df_age_info'):
             self.df_age_info = pd.read_csv(
-                f"{os.path.expanduser('~')}/data/mesa/datasets/mesa-sleep-dataset-0.6.0.csv")
+                f"{self.base_data_dir}/data/mesa/datasets/mesa-sleep-dataset-0.6.0.csv")
         rec_id = int(rec_name.split('-')[-1][:4])
         # age = self.df_age_info[self.df_age_info['mesaid']==rec_id].sleepage5c
         age = self.df_age_info[self.df_age_info['mesaid']==rec_id].sleepage5c.item()
@@ -494,7 +494,7 @@ class MesaDb():
     def find_age(self, rec_name):
         if not hasattr(self, 'df_age_info'):
             self.df_age_info = pd.read_csv(
-                f"{os.path.expanduser('~')}/data/mesa/datasets/mesa-sleep-dataset-0.6.0.csv")
+                f"{self.base_data_dir}/data/mesa/datasets/mesa-sleep-dataset-0.6.0.csv")
         rec_id = int(rec_name.split('-')[-1][:4])
         # age = self.df_age_info[self.df_age_info['mesaid']==rec_id].sleepage5c
         age = self.df_age_info[self.df_age_info['mesaid']==rec_id].sleepage5c.item()
