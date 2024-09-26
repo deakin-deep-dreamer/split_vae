@@ -8,7 +8,7 @@ hz: 100
 hz_rr: 5
 lr: 0.001
 lr_scheduler_patience: 10
-max_epoch: 200
+max_epoch: 10
 min_lr: 1e-6
 seg_len_sec: 30
 seg_len: -1
